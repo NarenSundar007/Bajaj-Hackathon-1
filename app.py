@@ -6,7 +6,7 @@ from collections import OrderedDict
 import google.generativeai as genai
 import numpy as np
 from typing import List, Dict, Any
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -25,6 +25,9 @@ from concurrent.futures import ThreadPoolExecutor
 import faiss
 import logging
 import shutil
+import docx2txt
+from bs4 import BeautifulSoup
+from urllib.parse import urlparse
 
 # Load environment variables
 load_dotenv()
@@ -63,11 +66,65 @@ _executor = ThreadPoolExecutor(max_workers=max(os.cpu_count() or 4, 4))
 
 # Models
 class BatchQueryRequest(BaseModel):
-    documents: str
+    documents: str  # URL to document or email content
     questions: List[str]
 
 class BatchQueryResponse(BaseModel):
     answers: List[str]
+
+# Helper functions
+def get_document_type(input_str: str) -> str:
+    if input_str.startswith("http"):
+        path = urlparse(input_str).path
+        ext = os.path.splitext(path)[1].lower()
+        if ext == ".pdf":
+            return "pdf"
+        elif ext == ".docx":
+            return "docx"
+        else:
+            return "unknown"
+    return "email"
+
+def clean_text(text: str) -> str:
+    return " ".join(text.split()).strip()
+
+# Document processing functions
+async def process_pdf(pdf_path: str) -> List[Dict[str, Any]]:
+    chunks = []
+    try:
+        loader = PyMuPDFLoader(pdf_path)
+        documents = loader.load()
+        text_splitter = TokenTextSplitter(chunk_size=settings.chunk_size, chunk_overlap=settings.chunk_overlap)
+        split_docs = text_splitter.split_documents(documents)
+        chunks.extend({"content": doc.page_content, "metadata": {"type": "text", "page": doc.metadata.get("page", 1)}} for doc in split_docs)
+    except Exception as e:
+        logging.error(f"Error processing PDF {pdf_path}: {e}")
+    return chunks
+
+async def process_docx(docx_path: str) -> List[Dict[str, Any]]:
+    chunks = []
+    try:
+        text = docx2txt.process(docx_path)
+        if text:
+            text_splitter = TokenTextSplitter(chunk_size=settings.chunk_size, chunk_overlap=settings.chunk_overlap)
+            split_texts = text_splitter.split_text(clean_text(text))
+            chunks.extend({"content": text, "metadata": {"type": "text"}} for text in split_texts)
+    except Exception as e:
+        logging.error(f"Error processing DOCX {docx_path}: {e}")
+    return chunks
+
+async def process_email(email_content: str) -> List[Dict[str, Any]]:
+    try:
+        if "<html" in email_content.lower():
+            text = BeautifulSoup(email_content, "html.parser").get_text()
+        else:
+            text = email_content
+        text_splitter = TokenTextSplitter(chunk_size=settings.chunk_size, chunk_overlap=settings.chunk_overlap)
+        split_texts = text_splitter.split_text(clean_text(text))
+        return [{"content": chunk, "metadata": {"type": "text", "source": "email"}} for chunk in split_texts]
+    except Exception as e:
+        logging.error(f"Error processing email content: {e}")
+        return []
 
 class QueryRetrievalSystem:
     def __init__(self):
@@ -174,86 +231,89 @@ Clauses: {clauses}"""
         vector_store.save_local(cache_path)
         logging.info(f"[CACHE] Cached vector store for {url} at {cache_path}")
 
-    async def process_document(self, blob_url: str) -> FAISS:
-        logging.info(f"[DOC] Processing document from URL: {blob_url}")
-        cache_id = hashlib.sha256(blob_url.encode()).hexdigest()
+    async def process_document(self, input_str: str) -> FAISS:
+        logging.info(f"[DOC] Processing document: {input_str}")
+        cache_id = hashlib.sha256(input_str.encode()).hexdigest()
         cache_path = os.path.join(settings.data_dir, cache_id)
 
         # Check if document is cached and content hasn't changed
         content_hash = None
-        if blob_url.startswith("http"):
+        if input_str.startswith("http"):
             async with aiohttp.ClientSession() as session:
-                async with session.head(blob_url, timeout=30) as response:
+                async with session.head(input_str, timeout=30) as response:
                     content = await response.read()
                     content_hash = hashlib.sha256(content).hexdigest()
-            if blob_url in self.vector_store_cache and self.document_hashes.get(blob_url) == content_hash:
+            if input_str in self.vector_store_cache and self.document_hashes.get(input_str) == content_hash:
                 logging.info("[DOC] Cache hit in memory.")
-                self.cache_access_times[blob_url] = asyncio.get_event_loop().time()
-                return self.vector_store_cache[blob_url]
+                self.cache_access_times[input_str] = asyncio.get_event_loop().time()
+                return self.vector_store_cache[input_str]
 
         # Check disk cache
         if os.path.exists(cache_path):
             try:
                 vs = FAISS.load_local(cache_path, embeddings=None, allow_dangerous_deserialization=True)
-                self.manage_cache(blob_url, vs, cache_path)
+                self.manage_cache(input_str, vs, cache_path)
                 if content_hash:
-                    self.document_hashes[blob_url] = content_hash
+                    self.document_hashes[input_str] = content_hash
                 logging.info(f"[DOC] Loaded FAISS index from disk cache: {cache_path}")
                 return vs
             except Exception as e:
                 logging.error(f"[DOC] Failed to load FAISS index from {cache_path}: {e}")
 
-        # Download and process document
-        async with aiohttp.ClientSession() as session:
-            async with session.get(blob_url, timeout=30) as response:
-                logging.info("[DOC] Downloading PDF...")
-                response.raise_for_status()
-                pdf_bytes = await response.read()
-                logging.info("[DOC] Download complete.")
-                if not content_hash:
-                    content_hash = hashlib.sha256(pdf_bytes).hexdigest()
+        # Process document based on type
+        doc_type = get_document_type(input_str)
+        if doc_type in ["pdf", "docx"]:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(input_str, timeout=30) as response:
+                    logging.info(f"[DOC] Downloading {doc_type.upper()}...")
+                    response.raise_for_status()
+                    content = await response.read()
+                    content_hash = hashlib.sha256(content).hexdigest()
+            suffix = ".pdf" if doc_type == "pdf" else ".docx"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+                temp_file.write(content)
+                temp_file_path = temp_file.name
+            try:
+                chunks = await process_pdf(temp_file_path) if doc_type == "pdf" else await process_docx(temp_file_path)
+            finally:
+                os.remove(temp_file_path)
+        elif doc_type == "email":
+            content_hash = hashlib.sha256(input_str.encode()).hexdigest()
+            chunks = await process_email(input_str)
+        else:
+            raise ValueError(f"Unsupported document type: {doc_type}")
 
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_pdf:
-            temp_pdf.write(pdf_bytes)
-            temp_pdf_path = temp_pdf.name
+        if not chunks:
+            raise ValueError(f"No content extracted from: {input_str}")
 
-        try:
-            loader = PyMuPDFLoader(temp_pdf_path)
-            documents = loader.load()
-            logging.info(f"[DOC] Loaded {len(documents)} documents.")
-            text_splitter = TokenTextSplitter(chunk_size=settings.chunk_size, chunk_overlap=settings.chunk_overlap)
-            chunks = text_splitter.split_documents(documents)
-            logging.info(f"[DOC] Chunked into {len(chunks)} segments.")
-            chunk_texts = [doc.page_content for doc in chunks]
+        chunk_texts = [chunk["content"] for chunk in chunks]
+        embeddings = await self.generate_embeddings(chunk_texts)
+        if len(embeddings) != len(chunk_texts):
+            raise ValueError("Failed to embed all chunks")
 
-            embeddings = await self.generate_embeddings(chunk_texts)
-            if not embeddings or len(embeddings) != len(chunk_texts):
-                raise ValueError("[ERROR] Failed to embed all chunks.")
+        # Store embeddings in document metadata
+        chunks_with_embeddings = [Document(page_content=c["content"], metadata={**c["metadata"], "embedding": e})
+                                 for c, e in zip(chunks, embeddings)]
 
-            # Store embeddings in document metadata
-            chunks_with_embeddings = [Document(page_content=text, metadata={"embedding": emb}) for text, emb in zip(chunk_texts, embeddings)]
+        # Create FAISS index with pre-computed embeddings
+        embeddings_array = np.array(embeddings).astype('float32')
+        dimension = embeddings_array.shape[1]
+        index = faiss.IndexFlatL2(dimension)
+        index.add(embeddings_array)
 
-            # Create FAISS index with pre-computed embeddings
-            embeddings_array = np.array(embeddings).astype('float32')
-            dimension = embeddings_array.shape[1]
-            index = faiss.IndexFlatL2(dimension)
-            index.add(embeddings_array)
+        # Create LangChain FAISS object
+        vector_store = FAISS(
+            embedding_function=None,  # Not needed since we handle query embedding separately
+            index=index,
+            docstore={i: chunks_with_embeddings[i] for i in range(len(chunks_with_embeddings))},
+            index_to_docstore_id={i: i for i in range(len(chunks_with_embeddings))}
+        )
 
-            # Create LangChain FAISS object
-            vector_store = FAISS(
-                embedding_function=None,  # Not needed since we handle query embedding separately
-                index=index,
-                docstore={i: chunks_with_embeddings[i] for i in range(len(chunks_with_embeddings))},
-                index_to_docstore_id={i: i for i in range(len(chunks_with_embeddings))}
-            )
+        # Manage cache
+        self.document_hashes[input_str] = content_hash
+        self.manage_cache(input_str, vector_store, cache_path)
 
-            # Manage cache (disk and memory)
-            self.document_hashes[blob_url] = content_hash
-            self.manage_cache(blob_url, vector_store, cache_path)
-
-            return vector_store
-        finally:
-            os.remove(temp_pdf_path)
+        return vector_store
 
     def rerank_chunks(self, query: str, docs: List[Document], query_emb: np.ndarray) -> List[Document]:
         logging.info(f"[RERANK] Reranking chunks for query: {query}")
