@@ -89,39 +89,40 @@ def clean_text(text: str) -> str:
     return " ".join(text.split()).strip()
 
 # Document processing functions
-async def process_pdf(pdf_path: str) -> List[Dict[str, Any]]:
-    chunks = []
+async def process_pdf(pdf_path: str) -> List[Document]:
     try:
         loader = PyMuPDFLoader(pdf_path)
         documents = loader.load()
         text_splitter = TokenTextSplitter(chunk_size=settings.chunk_size, chunk_overlap=settings.chunk_overlap)
         split_docs = text_splitter.split_documents(documents)
-        chunks.extend({"content": doc.page_content, "metadata": {"type": "text", "page": doc.metadata.get("page", 1)}} for doc in split_docs)
+        return split_docs
     except Exception as e:
         logging.error(f"Error processing PDF {pdf_path}: {e}")
-    return chunks
+        return []
 
-async def process_docx(docx_path: str) -> List[Dict[str, Any]]:
-    chunks = []
+async def process_docx(docx_path: str) -> List[Document]:
     try:
         text = docx2txt.process(docx_path)
         if text:
+            cleaned_text = clean_text(text)
             text_splitter = TokenTextSplitter(chunk_size=settings.chunk_size, chunk_overlap=settings.chunk_overlap)
-            split_texts = text_splitter.split_text(clean_text(text))
-            chunks.extend({"content": text, "metadata": {"type": "text"}} for text in split_texts)
+            split_texts = text_splitter.split_text(cleaned_text)
+            return [Document(page_content=chunk, metadata={"type": "text"}) for chunk in split_texts]
+        return []
     except Exception as e:
         logging.error(f"Error processing DOCX {docx_path}: {e}")
-    return chunks
+        return []
 
-async def process_email(email_content: str) -> List[Dict[str, Any]]:
+async def process_email(email_content: str) -> List[Document]:
     try:
         if "<html" in email_content.lower():
             text = BeautifulSoup(email_content, "html.parser").get_text()
         else:
             text = email_content
+        cleaned_text = clean_text(text)
         text_splitter = TokenTextSplitter(chunk_size=settings.chunk_size, chunk_overlap=settings.chunk_overlap)
-        split_texts = text_splitter.split_text(clean_text(text))
-        return [{"content": chunk, "metadata": {"type": "text", "source": "email"}} for chunk in split_texts]
+        split_texts = text_splitter.split_text(cleaned_text)
+        return [Document(page_content=chunk, metadata={"type": "text", "source": "email"}) for chunk in split_texts]
     except Exception as e:
         logging.error(f"Error processing email content: {e}")
         return []
@@ -152,7 +153,7 @@ Clauses: {clauses}"""
         self.memory_usage = 0  # Track in-memory vector store size
 
     async def generate_embeddings(self, texts: List[str]) -> List[List[float]]:
-        logging.info(f"[EMBED] Generating embeddings for {len(texts)} texts...")
+        # Embedding generation started
         loop = asyncio.get_event_loop()
 
         def _embed(text: str):
@@ -169,7 +170,7 @@ Clauses: {clauses}"""
 
         results = await asyncio.gather(*[loop.run_in_executor(_executor, _embed, text) for text in texts])
         valid = [r for r in results if r is not None]
-        logging.info(f"[EMBED] Completed. Success: {len(valid)} / {len(texts)}")
+        # Embedding generation completed
         return valid
 
     def cosine_similarity(self, a: List[float], b: List[float]) -> float:
@@ -240,7 +241,8 @@ Clauses: {clauses}"""
         content_hash = None
         if input_str.startswith("http"):
             async with aiohttp.ClientSession() as session:
-                async with session.head(input_str, timeout=30) as response:
+                async with session.get(input_str, timeout=30) as response:
+                    response.raise_for_status()
                     content = await response.read()
                     content_hash = hashlib.sha256(content).hexdigest()
             if input_str in self.vector_store_cache and self.document_hashes.get(input_str) == content_hash:
@@ -286,14 +288,15 @@ Clauses: {clauses}"""
         if not chunks:
             raise ValueError(f"No content extracted from: {input_str}")
 
-        chunk_texts = [chunk["content"] for chunk in chunks]
+        # Extract text from Document objects
+        chunk_texts = [doc.page_content for doc in chunks]
         embeddings = await self.generate_embeddings(chunk_texts)
         if len(embeddings) != len(chunk_texts):
             raise ValueError("Failed to embed all chunks")
 
         # Store embeddings in document metadata
-        chunks_with_embeddings = [Document(page_content=c["content"], metadata={**c["metadata"], "embedding": e})
-                                 for c, e in zip(chunks, embeddings)]
+        chunks_with_embeddings = [Document(page_content=doc.page_content, metadata={**doc.metadata, "embedding": e})
+                                 for doc, e in zip(chunks, embeddings)]
 
         # Create FAISS index with pre-computed embeddings
         embeddings_array = np.array(embeddings).astype('float32')
@@ -316,21 +319,21 @@ Clauses: {clauses}"""
         return vector_store
 
     def rerank_chunks(self, query: str, docs: List[Document], query_emb: np.ndarray) -> List[Document]:
-        logging.info(f"[RERANK] Reranking chunks for query: {query}")
+        # Reranking chunks for query
         chunk_embs = [doc.metadata["embedding"] for doc in docs]
         scores = [self.cosine_similarity(query_emb, np.array(emb)) for emb in chunk_embs]
         ranked = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
-        logging.info(f"[RERANK] Top 5 scores: {[round(s, 3) for s, _ in ranked[:5]]}")
+        # Top 5 scores calculated
         return [doc for _, doc in ranked[:5]]
 
     async def process_batch_queries(self, document_url: str, questions: List[str]) -> List[str]:
-        logging.info(f"[PROCESS] Running batch for {len(questions)} questions...")
+        # Running batch for questions
         vector_store = await self.process_document(document_url)
         index = vector_store.index
         docstore = vector_store.docstore
 
         async def handle(q: str) -> str:
-            logging.info(f"[QUERY] Processing: {q}")
+            # Processing query
             query_emb = await self.generate_embeddings([q])
             if not query_emb:
                 return "Failed to embed query"
@@ -346,7 +349,7 @@ Clauses: {clauses}"""
 
             try:
                 response = await self.llm_chain.ainvoke({"query": q, "clauses": text})
-                logging.info(f"[LLM] Response: {response}")
+                # LLM response received
                 return self.parse_llm_response(response).get("answer", "Unable to determine")
             except Exception as e:
                 logging.error(f"[LLM ERROR] Failed LLM call: {e}")
@@ -387,10 +390,8 @@ query_system = QueryRetrievalSystem()
 
 @app.post("/hackrx/run", response_model=BatchQueryResponse)
 async def process_batch_queries(request: BatchQueryRequest):
-    logging.info(f"[API] Received document: {request.documents}")
-    logging.info(f"[API] Questions: {request.questions}")
+    # API received questions
     answers = await query_system.process_batch_queries(request.documents, request.questions)
-    logging.info(f"[API] Final answers: {answers}")
     return BatchQueryResponse(answers=answers)
 
 @app.exception_handler(Exception)

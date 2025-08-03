@@ -16,7 +16,5 @@ tiktoken
 pdfplumber
 python-docx
 beautifulsoup4
-email-validator
 unstructured
-frontend
 docx2txt
