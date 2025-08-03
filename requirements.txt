@@ -16,5 +16,4 @@ tiktoken
 pdfplumber
 python-docx
 beautifulsoup4
-unstructured
 docx2txt
