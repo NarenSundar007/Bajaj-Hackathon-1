@@ -27,5 +27,13 @@ Dockerfile
 *.db
 *.md
 
+# Cache and Data
+data/
+./data/
+cache/
+*.faiss
+*.pkl
+*.pickle
+
 # Git
 .git/
